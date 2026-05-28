@@ -32,7 +32,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
-    AutoTokenizer,
+    AutoProcessor,
     Qwen2VLForConditionalGeneration,
     TrainerCallback,
     TrainerControl,
@@ -59,7 +59,7 @@ def load_jsonl(path: str) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def build_dataset(records: list[dict], tokenizer, include_weights: bool) -> Dataset:
+def build_dataset(records: list[dict], processor, include_weights: bool) -> Dataset:
     """Convert JSONL records to a HuggingFace Dataset for DPOTrainer.
 
     TRL expects: prompt (str), chosen (str), rejected (str).
@@ -68,7 +68,7 @@ def build_dataset(records: list[dict], tokenizer, include_weights: bool) -> Data
     """
     rows = []
     for r in records:
-        prompt = tokenizer.apply_chat_template(
+        prompt = tokenizer.tokenizer.apply_chat_template(
             r["messages"],
             tokenize=False,
             add_generation_prompt=True,
@@ -250,10 +250,11 @@ def main():
     )
     model.config.use_cache = False
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # required for DPO
+    # TRL's DPOTrainer expects a processor for VLMs; it calls processor.tokenizer internally
+    processor = AutoProcessor.from_pretrained(args.model)
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+    processor.tokenizer.padding_side = "left"  # required for DPO
 
     lora_cfg = LoraConfig(
         r=LORA_R,
@@ -276,8 +277,8 @@ def main():
         val_records = val_records[:20]
         print("[DEBUG] Truncated to 50 train / 20 val examples")
 
-    train_ds = build_dataset(train_records, tokenizer, include_weights=args.weighted)
-    val_ds = build_dataset(val_records, tokenizer, include_weights=args.weighted)
+    train_ds = build_dataset(train_records, processor, include_weights=args.weighted)
+    val_ds = build_dataset(val_records, processor, include_weights=args.weighted)
     print(f"Train: {len(train_ds):,}  |  Val: {len(val_ds):,}")
 
     # ── training config ───────────────────────────────────────────────────
@@ -316,7 +317,7 @@ def main():
         args=dpo_cfg,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
+        tokenizer=processor,
         callbacks=[LossLogCallback(loss_log_path, save_every=10)],
     )
 
@@ -326,7 +327,7 @@ def main():
 
     final_path = out_dir / "final"
     trainer.save_model(str(final_path))
-    tokenizer.save_pretrained(str(final_path))
+    processor.save_pretrained(str(final_path))
     print(f"\nSaved to {final_path}")
     print(f"Loss log:  {loss_log_path}")
     if not args.no_wandb:
