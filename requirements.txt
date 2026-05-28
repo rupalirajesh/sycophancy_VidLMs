@@ -1,0 +1,14 @@
+# dataset generation
+openai>=1.30.0
+huggingface_hub>=0.24.0
+tqdm>=4.66.0
+
+# training (pin for reproducibility on Colab)
+transformers==4.45.2
+trl==0.11.4
+peft==0.12.0
+accelerate==0.34.2
+bitsandbytes==0.43.3
+datasets>=2.20.0
+wandb>=0.17.0
+matplotlib>=3.7.0

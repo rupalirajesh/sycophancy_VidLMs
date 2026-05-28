@@ -1,0 +1,22 @@
+# raw annotation data (4.6 GB)
+data/
+
+# generated checkpoint (redundant with train/val splits)
+output/checkpoint.jsonl
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# trained model checkpoints (large; save to Drive instead)
+checkpoints/
+
+# system
+.DS_Store
+.claude/
+
+# jupyter checkpoints
+.ipynb_checkpoints/
