@@ -1,0 +1,26 @@
+{
+  "total": 10261,
+  "train": 9209,
+  "val": 1052,
+  "by_type": {
+    "B": 1904,
+    "A": 4614,
+    "D": 1882,
+    "C": 1861
+  },
+  "by_qt": {
+    "weather": 2438,
+    "activity": 1819,
+    "counting": 1613,
+    "camera_motion": 2563,
+    "scene_type": 1828
+  },
+  "pressure_dist": {
+    "4": 1234,
+    "1": 945,
+    "2": 1213,
+    "3": 1222
+  },
+  "avg_chosen_words": 29.8,
+  "avg_rejected_words": 16.2
+}
