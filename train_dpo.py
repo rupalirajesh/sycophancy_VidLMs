@@ -84,6 +84,20 @@ def build_dataset(records: list[dict], processor, include_weights: bool) -> Data
     return Dataset.from_list(rows)
 
 
+# ── text-only DPO base ───────────────────────────────────────────────────────
+
+class TextOnlyDPOTrainer(DPOTrainer):
+    """Forces text-only mode even when a VLM processor is passed.
+
+    TRL sets is_vision_model=True when it sees Qwen2VLProcessor (which has an
+    image_processor attribute), then unconditionally looks for pixel_values in
+    every batch. Our dataset is text-only, so we override the flag after init.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_vision_model = False
+
+
 # ── weighted DPO ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -98,7 +112,7 @@ class WeightedDPOCollator:
         return batch
 
 
-class WeightedDPOTrainer(DPOTrainer):
+class WeightedDPOTrainer(TextOnlyDPOTrainer):
     """DPO trainer that scales each sample's loss by loss_weight.
 
     Pressure-level mapping: p1→0.1, p2→0.2, p3→0.3, p4→0.4, B/C/D→1.0.
@@ -312,7 +326,7 @@ def main():
         max_steps=5 if args.debug else -1,
     )
 
-    TrainerClass = WeightedDPOTrainer if args.weighted else DPOTrainer
+    TrainerClass = WeightedDPOTrainer if args.weighted else TextOnlyDPOTrainer
     trainer = TrainerClass(
         model=model,
         ref_model=None,          # PEFT mode: base model is the implicit reference
