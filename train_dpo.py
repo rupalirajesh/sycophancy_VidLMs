@@ -18,8 +18,7 @@ Colab setup:
                  accelerate==0.34.2 bitsandbytes==0.43.3 wandb datasets -q
 
 NOTE: This trains on text descriptions (scene_desc embedded in messages).
-      To use actual video frames, replace `messages` with Qwen2VL visual inputs
-      and swap AutoModelForCausalLM → Qwen2VLForConditionalGeneration.
+      To use actual video frames, replace `messages` with Qwen2VL visual inputs.
 """
 
 import argparse
@@ -33,8 +32,8 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
+    Qwen2VLForConditionalGeneration,
     BitsAndBytesConfig,
     TrainerCallback,
     TrainerControl,
@@ -243,7 +242,7 @@ def main():
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_use_double_quant=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model,
         quantization_config=bnb,
         device_map="auto",
