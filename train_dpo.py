@@ -15,7 +15,7 @@ checkpoints/<run_name>/loss_log.json every 10 steps.
 
 Colab setup:
     !pip install transformers==4.45.2 trl==0.11.4 peft==0.12.0 \
-                 accelerate==0.34.2 bitsandbytes==0.43.3 wandb datasets -q
+                 accelerate==0.34.2 wandb datasets -q
 
 NOTE: This trains on text descriptions (scene_desc embedded in messages).
       To use actual video frames, replace `messages` with Qwen2VL visual inputs.
@@ -34,7 +34,6 @@ from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoTokenizer,
     Qwen2VLForConditionalGeneration,
-    BitsAndBytesConfig,
     TrainerCallback,
     TrainerControl,
     TrainerState,
@@ -242,18 +241,12 @@ def main():
         print(f"W&B run: {wandb.run.url}\n")
 
     # ── model ─────────────────────────────────────────────────────────────
-    print(f"Loading {args.model} in 4-bit QLoRA mode...")
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
+    # bf16 + LoRA fits comfortably on A100 40GB (~14 GB base, no quantization needed)
+    print(f"Loading {args.model} in bf16 + LoRA mode...")
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model,
-        quantization_config=bnb,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=True,
     )
     model.config.use_cache = False
 
@@ -310,7 +303,7 @@ def main():
         report_to=[] if args.no_wandb else ["wandb"],
         run_name=run_name,
         dataloader_num_workers=0,
-        optim="paged_adamw_8bit",      # memory-efficient optimizer
+        optim="adamw_torch_fused",
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         max_steps=5 if args.debug else -1,
