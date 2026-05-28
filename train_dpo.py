@@ -68,7 +68,7 @@ def build_dataset(records: list[dict], processor, include_weights: bool) -> Data
     """
     rows = []
     for r in records:
-        prompt = tokenizer.tokenizer.apply_chat_template(
+        prompt = processor.tokenizer.apply_chat_template(
             r["messages"],
             tokenize=False,
             add_generation_prompt=True,
@@ -250,11 +250,13 @@ def main():
     )
     model.config.use_cache = False
 
-    # TRL's DPOTrainer expects a processor for VLMs; it calls processor.tokenizer internally
     processor = AutoProcessor.from_pretrained(args.model)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
     processor.tokenizer.padding_side = "left"  # required for DPO
+    # TRL 0.11 double-unwraps VLM processors: first extracts .tokenizer from the processor,
+    # then calls .tokenizer again on the result. Self-reference prevents the AttributeError.
+    processor.tokenizer.tokenizer = processor.tokenizer
 
     lora_cfg = LoraConfig(
         r=LORA_R,
