@@ -211,19 +211,26 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--beta", type=float, default=0.1, help="DPO regularization strength")
     p.add_argument("--max-length", type=int, default=1024)
+    p.add_argument("--debug", action="store_true",
+                   help="Smoke-test: 50 examples, 5 steps, no save, no W&B")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    if args.debug:
+        args.no_wandb = True
+
     run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen2vl"
+    if args.debug:
+        run_name += "-debug"
     out_dir = Path(args.output_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     loss_log_path = str(out_dir / "loss_log.json")
 
     print(f"\n{'='*60}")
-    print(f"  Run: {run_name}")
+    print(f"  Run: {run_name}{'  [DEBUG]' if args.debug else ''}")
     print(f"  Output: {out_dir}")
     print(f"  Loss log: {loss_log_path}")
     print(f"{'='*60}\n")
@@ -232,7 +239,7 @@ def main():
     if not args.no_wandb:
         import wandb
         wandb.init(project="sycophancy-dpo", name=run_name, config=vars(args))
-        print(f"W&B run: {wandb.run.get_url()}\n")
+        print(f"W&B run: {wandb.run.url}\n")
 
     # ── model ─────────────────────────────────────────────────────────────
     print(f"Loading {args.model} in 4-bit QLoRA mode...")
@@ -271,6 +278,11 @@ def main():
     train_records = load_jsonl(args.train)
     val_records = load_jsonl(args.val)
 
+    if args.debug:
+        train_records = train_records[:50]
+        val_records = val_records[:20]
+        print("[DEBUG] Truncated to 50 train / 20 val examples")
+
     train_ds = build_dataset(train_records, tokenizer, include_weights=args.weighted)
     val_ds = build_dataset(val_records, tokenizer, include_weights=args.weighted)
     print(f"Train: {len(train_ds):,}  |  Val: {len(val_ds):,}")
@@ -278,22 +290,22 @@ def main():
     # ── training config ───────────────────────────────────────────────────
     dpo_cfg = DPOConfig(
         output_dir=str(out_dir),
-        num_train_epochs=args.epochs,
+        num_train_epochs=1 if args.debug else args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
+        gradient_accumulation_steps=1 if args.debug else args.grad_accum,
         learning_rate=args.lr,
         beta=args.beta,
         max_length=args.max_length,
         max_prompt_length=args.max_length // 2,
         bf16=True,
-        logging_steps=10,
+        logging_steps=1 if args.debug else 10,
         eval_strategy="steps",
-        eval_steps=200,
-        save_strategy="steps",
+        eval_steps=5 if args.debug else 200,
+        save_strategy="no" if args.debug else "steps",
         save_steps=200,
         save_total_limit=3,
-        load_best_model_at_end=False,  # avoids reloading large checkpoints
+        load_best_model_at_end=False,
         remove_unused_columns=False,   # keep loss_weight column in batch
         report_to=[] if args.no_wandb else ["wandb"],
         run_name=run_name,
@@ -301,6 +313,7 @@ def main():
         optim="paged_adamw_8bit",      # memory-efficient optimizer
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
+        max_steps=5 if args.debug else -1,
     )
 
     TrainerClass = WeightedDPOTrainer if args.weighted else DPOTrainer
@@ -325,7 +338,7 @@ def main():
     print(f"Loss log:  {loss_log_path}")
     if not args.no_wandb:
         import wandb
-        print(f"W&B:       {wandb.run.get_url()}")
+        print(f"W&B:       {wandb.run.url}")
         wandb.finish()
 
 
