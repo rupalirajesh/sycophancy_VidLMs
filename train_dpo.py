@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_dpo.py — Video DPO training for Qwen3-VL sycophancy resistance.
+train_dpo.py — Video DPO training for Qwen2.5-VL sycophancy resistance.
 
 Each training example passes actual video frames to the model so it learns
 to ground its answers in visual evidence rather than text pressure.
@@ -38,13 +38,13 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, get_cosine_schedule_with_warmup
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, get_cosine_schedule_with_warmup
 
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-NFRAMES = 2   # frames sampled per video (more OOMs on A100 40GB with Qwen3-VL-8B)
+NFRAMES = 8   # frames sampled per video
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ def parse_args():
     p.add_argument("--train",      default="output/train.jsonl")
     p.add_argument("--val",        default="output/val.jsonl")
     p.add_argument("--video-dir",  default="data/videos", help="Directory with {video_id}.mp4 files")
-    p.add_argument("--model",      default="Qwen/Qwen3-VL-8B-Instruct")
+    p.add_argument("--model",      default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--output-dir", default="checkpoints")
     p.add_argument("--weighted",   action="store_true", help="Pressure-weighted DPO")
     p.add_argument("--no-wandb",   action="store_true")
@@ -244,7 +244,7 @@ def main():
     random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen3vl-video"
+    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen25vl-video"
     if args.debug:
         run_name += "-debug"
     out_dir = Path(args.output_dir) / run_name
@@ -260,7 +260,7 @@ def main():
 
     # ── model + processor ────────────────────────────────────────────────
     print(f"Loading {args.model}...")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
     model.config.use_cache = False

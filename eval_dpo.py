@@ -7,7 +7,7 @@ in visual evidence — the same setup used during training.
 
 Usage (Colab):
     python eval_dpo.py \
-        --base   Qwen/Qwen3-VL-8B-Instruct \
+        --base   Qwen/Qwen2.5-VL-7B-Instruct \
         --std    /content/drive/MyDrive/sycophancy_dpo/standard/final \
         --wtd    /content/drive/MyDrive/sycophancy_dpo/weighted/final \
         --val    output/val.jsonl \
@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 NFRAMES = 8
 
@@ -123,7 +123,7 @@ def inject_video(messages: list[dict], video_path: str) -> list[dict]:
 
 def load_base(model_id: str):
     print(f"Loading base model: {model_id}")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, device_map="auto"
     )
     model.eval()
@@ -184,7 +184,7 @@ def print_result(label: str, messages: list[dict], responses: dict[str, str]):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--base",      default="Qwen/Qwen3-VL-8B-Instruct")
+    p.add_argument("--base",      default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--std",       default=None, help="Path to standard DPO adapter")
     p.add_argument("--wtd",       default=None, help="Path to weighted DPO adapter")
     p.add_argument("--val",       default="output/val.jsonl")
