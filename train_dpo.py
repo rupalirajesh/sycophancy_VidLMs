@@ -20,11 +20,16 @@ DPO loss (per sample):
 
     where v = video frames. Reference model = base model with LoRA disabled.
 
-Weighted variant loss weights (--weighted):
+Weighted variant loss weights (--weighted, stored in dataset loss_weight field):
     Type A (sycophancy resistance): α = pressure_level / 10  →  0.1, 0.2, 0.3, 0.4
     Type B (correction acceptance): α = 0.1
     Type C (true-claim confirmation): α = 0.1
     Type D (neutral factual Q&A): α = 0.1
+
+Checkpoint resume:
+    If training crashes, rerunning the same command automatically resumes from the
+    last saved checkpoint (every 200 steps). Optimizer, scheduler, and model adapter
+    are all restored; data fast-forwards to the correct position via per-epoch seeding.
 
 Memory design:
     The visual encoder is expensive (~8-10 GB peak, O(N²) attention over frame patches)
@@ -43,7 +48,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, get_cosine_schedule_with_warmup
 
@@ -55,9 +60,8 @@ LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 NFRAMES = 4
 
-# In --weighted mode, B/C/D examples are de-emphasized so Type A (sycophancy resistance)
-# dominates gradient signal. Type A uses its per-example pressure weight from the dataset.
-_BCD_WEIGHT = 0.1
+_RESUME_STATE = "resume_state.json"
+_LATEST_CKPT  = "checkpoint-latest"
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -264,6 +268,13 @@ class LossLog:
     def __init__(self, path: str):
         self.path = path
         self._log: list[dict] = []
+        # Load existing log on resume
+        if Path(path).exists():
+            try:
+                with open(path) as f:
+                    self._log = json.load(f)
+            except Exception:
+                pass
 
     def add(self, step: int, **kwargs):
         self._log.append({"step": step, **{k: round(float(v), 4) for k, v in kwargs.items()}})
@@ -278,6 +289,28 @@ class LossLog:
         self._flush()
 
 
+# ── checkpoint resume helpers ─────────────────────────────────────────────────
+
+def _save_resume_state(out_dir: Path, model, optimizer, scheduler,
+                       global_step: int, epoch: int, local_step: int):
+    """Save full training state to checkpoint-latest/ for crash recovery."""
+    model.save_pretrained(str(out_dir / _LATEST_CKPT))
+    torch.save(optimizer.state_dict(), out_dir / "optimizer_latest.pt")
+    torch.save(scheduler.state_dict(), out_dir / "scheduler_latest.pt")
+    with open(out_dir / _RESUME_STATE, "w") as f:
+        json.dump({"global_step": global_step, "epoch": epoch, "local_step": local_step}, f)
+
+
+def _load_resume_state(out_dir: Path) -> dict | None:
+    """Return saved resume metadata if a valid checkpoint exists, else None."""
+    state_file = out_dir / _RESUME_STATE
+    latest_dir = out_dir / _LATEST_CKPT
+    if not state_file.exists() or not latest_dir.exists():
+        return None
+    with open(state_file) as f:
+        return json.load(f)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -287,7 +320,7 @@ def parse_args():
     p.add_argument("--video-dir",  default="data/videos", help="Directory with {video_id}.mp4 files")
     p.add_argument("--model",      default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--output-dir", default="checkpoints")
-    p.add_argument("--weighted",   action="store_true", help="Pressure-weighted DPO")
+    p.add_argument("--weighted",   action="store_true", help="Pressure-weighted DPO (recommended)")
     p.add_argument("--no-wandb",   action="store_true")
     p.add_argument("--debug",      action="store_true", help="5 steps, no save, no W&B")
     p.add_argument("--epochs",     type=int,   default=2)
@@ -317,32 +350,47 @@ def main():
 
     print(f"\n{'='*60}\n  {run_name}\n  Output: {out_dir}\n{'='*60}\n")
 
-    # ── W&B ──────────────────────────────────────────────────────────────
+    # ── resume state ─────────────────────────────────────────────────
+    resume_state = None if args.debug else _load_resume_state(out_dir)
+    if resume_state:
+        print(f"Resume checkpoint found — step {resume_state['global_step']}, "
+              f"epoch {resume_state['epoch']}, local_step {resume_state['local_step']}\n")
+
+    # ── W&B ──────────────────────────────────────────────────────────
     if not args.no_wandb:
         import wandb
-        wandb.init(project="sycophancy-dpo", name=run_name, config=vars(args))
+        wandb.init(project="sycophancy-dpo", name=run_name, config=vars(args),
+                   resume="allow" if resume_state else None)
         print(f"W&B: {wandb.run.url}\n")
 
-    # ── model + processor ────────────────────────────────────────────────
+    # ── model + processor ────────────────────────────────────────────
     print(f"Loading {args.model}...")
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
-    model.config.use_cache = False
+    base_model.config.use_cache = False
 
     processor = AutoProcessor.from_pretrained(args.model)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    lora_cfg = LoraConfig(
-        r=LORA_R, lora_alpha=LORA_ALPHA, target_modules=LORA_TARGETS,
-        lora_dropout=LORA_DROPOUT, bias="none", task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_cfg)
+    # ── LoRA — fresh or resumed ───────────────────────────────────────
+    if resume_state:
+        print(f"Loading LoRA adapter from {out_dir / _LATEST_CKPT}...")
+        model = PeftModel.from_pretrained(
+            base_model, str(out_dir / _LATEST_CKPT), is_trainable=True
+        )
+    else:
+        lora_cfg = LoraConfig(
+            r=LORA_R, lora_alpha=LORA_ALPHA, target_modules=LORA_TARGETS,
+            lora_dropout=LORA_DROPOUT, bias="none", task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_cfg)
+
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.print_trainable_parameters()
 
-    # ── data ─────────────────────────────────────────────────────────────
+    # ── data ─────────────────────────────────────────────────────────
     print("\nLoading dataset...")
     train_records = load_jsonl(args.train)
     val_records   = load_jsonl(args.val)
@@ -361,10 +409,9 @@ def main():
             f"and run download_videos.py first."
         )
 
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=lambda x: x[0])
-    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
 
-    # ── optimizer ────────────────────────────────────────────────────────
+    # ── optimizer ────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=0.01,
@@ -373,30 +420,55 @@ def main():
     warmup_steps = max(1, int(0.05 * total_steps))
     scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
+    # ── restore optimizer + scheduler on resume ───────────────────────
+    global_step = 0
+    if resume_state:
+        global_step = resume_state["global_step"]
+        opt_path = out_dir / "optimizer_latest.pt"
+        sch_path = out_dir / "scheduler_latest.pt"
+        if opt_path.exists():
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device, weights_only=True))
+        if sch_path.exists():
+            scheduler.load_state_dict(torch.load(sch_path, weights_only=True))
+        print(f"Optimizer and scheduler restored. Resuming at step {global_step}.\n")
+
     max_steps = 5 if args.debug else total_steps
     loss_log  = LossLog(str(out_dir / "loss_log.json"))
 
-    # ── training loop ─────────────────────────────────────────────────────
     print(f"\nStarting training — {total_steps} optimizer steps "
           f"({len(train_ds)} examples × {args.epochs} epochs ÷ {args.grad_accum} accum)\n")
 
-    global_step          = 0
-    accum_loss           = 0.0
-    accum_reward_margin  = 0.0
+    # Resume bookmarks: which epoch and how many examples to skip within it
+    resume_epoch      = resume_state["epoch"]           if resume_state else 0
+    resume_local_skip = resume_state["local_step"] + 1  if resume_state else 0
+
+    accum_loss          = 0.0
+    accum_reward_margin = 0.0
     optimizer.zero_grad()
 
+    # ── training loop ─────────────────────────────────────────────────
     for epoch in range(args.epochs):
+        if epoch < resume_epoch:
+            continue  # skip completed epochs (per-epoch seeding makes this safe)
+
+        # Per-epoch generator gives a deterministic, resumable shuffle for each epoch.
+        gen = torch.Generator()
+        gen.manual_seed(args.seed + epoch)
+        train_loader = DataLoader(
+            train_ds, batch_size=1, shuffle=True,
+            collate_fn=lambda x: x[0], generator=gen,
+        )
+        skip = resume_local_skip if epoch == resume_epoch else 0
+
         for local_step, record in enumerate(train_loader):
             if global_step >= max_steps:
                 break
+            if local_step < skip:
+                continue  # fast-forward past already-trained examples
 
             video_path = str(Path(args.video_dir) / f"{record['video_id']}.mp4")
             messages   = inject_video(record["messages"], video_path)
-            if args.weighted:
-                etype = record.get("example_type", "A")
-                weight = _BCD_WEIGHT if etype in ("B", "C", "D") else float(record.get("loss_weight", 1.0))
-            else:
-                weight = 1.0
+            weight     = float(record.get("loss_weight", 1.0)) if args.weighted else 1.0
 
             try:
                 # Visual encoder runs ONCE here; chosen/rejected share the result
@@ -446,7 +518,7 @@ def main():
             policy_rejected_logps.backward(g)
             del policy_rejected_logps
 
-            if (local_step + 1) % args.grad_accum == 0:
+            if (local_step + 1 - skip) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
@@ -503,16 +575,18 @@ def main():
                         wandb.log({"eval_loss": eval_loss}, step=global_step)
                     model.train()
 
-                # Checkpoint
+                # Checkpoint every 200 steps — also saves resume state for crash recovery
                 if not args.debug and global_step % 200 == 0:
                     ckpt = out_dir / f"checkpoint-{global_step}"
                     model.save_pretrained(str(ckpt))
+                    _save_resume_state(out_dir, model, optimizer, scheduler,
+                                       global_step, epoch, local_step)
                     print(f"  Saved checkpoint to {ckpt}")
 
         if global_step >= max_steps:
             break
 
-    # ── final save ───────────────────────────────────────────────────────
+    # ── final save ───────────────────────────────────────────────────
     loss_log.close()
     if not args.debug:
         final = out_dir / "final"
