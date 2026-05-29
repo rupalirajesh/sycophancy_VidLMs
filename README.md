@@ -116,13 +116,21 @@ python train_dpo.py --video-dir data/videos --weighted --debug
 ```
 checkpoints/
 └── weighted-dpo-qwen25vl-video/
-    ├── checkpoint-200/     # LoRA adapter saved every 200 steps
+    ├── checkpoint-200/       # LoRA adapter saved every 200 steps
     ├── checkpoint-400/
-    ├── final/              # Final LoRA adapter + processor
-    └── loss_log.json       # Per-step train loss and reward margin
+    ├── checkpoint-latest/    # Always the most recent — used for crash recovery
+    ├── optimizer_latest.pt   # Optimizer state for resume
+    ├── scheduler_latest.pt   # LR scheduler state for resume
+    ├── resume_state.json     # Step/epoch position for resume
+    ├── final/                # Final LoRA adapter + processor
+    └── loss_log.json         # Per-step train loss and reward margin
 ```
 
 Eval runs every 100 optimizer steps on the first 50 val examples.
+
+### Crash recovery
+
+If training crashes, just rerun the exact same command — it automatically picks up from the last 200-step checkpoint. Adapter weights, optimizer, and scheduler are all restored; the dataloader fast-forwards to the correct position.
 
 ### Plot training curves
 
