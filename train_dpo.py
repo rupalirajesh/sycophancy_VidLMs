@@ -145,7 +145,9 @@ def encode_prompt_embeds(model, processor, messages_with_video: list[dict], devi
             grid = prompt_enc["video_grid_thw"].to(device)
             # Run visual encoder exactly once — this is the expensive step
             visual_enc = base.model.visual if hasattr(base.model, "visual") else base.visual
-            video_embeds = visual_enc(pv, grid_thw=grid)
+            video_out = visual_enc(pv, grid_thw=grid)
+            # transformers>=4.57 wraps the output in BaseModelOutputWithPooling
+            video_embeds = video_out.last_hidden_state if hasattr(video_out, "last_hidden_state") else video_out
             video_mask = (
                 (input_ids == base.config.video_token_id)
                 .unsqueeze(-1)
