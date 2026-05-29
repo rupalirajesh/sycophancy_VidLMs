@@ -127,16 +127,21 @@ def main():
 
     needed = load_needed_ids(args.train, args.val)
 
+    # Videos whose group couldn't be determined get searched in every group's tar.
+    unknown_ids = {vid for vid, g in needed.items() if g == "unknown"}
+    if unknown_ids:
+        print(f"Group unknown for {len(unknown_ids)} videos — will scan all groups.")
+
     for group in GROUPS_NEEDED:
-        group_ids = {vid for vid, g in needed.items() if g == group}
+        group_ids = {vid for vid, g in needed.items() if g == group} | unknown_ids
         if not group_ids:
             continue
         already = {p.stem for p in video_dir.glob("*.mp4")}
         remaining = group_ids - already
         if not remaining:
-            print(f"{group}: all {len(group_ids)} videos already downloaded.")
+            print(f"{group}: all needed videos already downloaded.")
             continue
-        print(f"{group}: need {len(remaining)}/{len(group_ids)} videos.")
+        print(f"{group}: searching for {len(remaining)} videos.")
         download_and_extract(group, remaining, video_dir, args.hf_token)
 
     # Final count
