@@ -6,24 +6,25 @@ Each training example passes actual video frames to the model so it learns
 to ground its answers in visual evidence rather than text pressure.
 
 Usage:
-    python train_dpo.py \
-        --video-dir data/videos \
-        --train output/train.jsonl \
-        --val   output/val.jsonl
+    python train_dpo.py --video-dir data/videos --weighted
+    python train_dpo.py --video-dir data/videos --weighted --model Qwen/Qwen2.5-VL-72B-Instruct
+    python train_dpo.py --video-dir data/videos --weighted --debug   # 5-step smoke test
 
-    python train_dpo.py --video-dir data/videos --weighted   # pressure-weighted variant
-    python train_dpo.py --video-dir data/videos --debug      # 5-step smoke test
-
-Colab setup:
-    !pip install "transformers>=4.57.0" "peft>=0.18.0" "torchao>=0.16.0" accelerate \
-                 qwen-vl-utils wandb datasets -q
+Setup:
+    pip install "transformers>=4.57.0" "peft>=0.18.0" accelerate qwen-vl-utils wandb
+    # Install PyTorch separately per https://pytorch.org/get-started/locally/
 
 DPO loss (per sample):
     L = -log sigmoid( beta * ((log π(chosen|x,v) - log π_ref(chosen|x,v))
                              - (log π(rejected|x,v) - log π_ref(rejected|x,v))) )
 
     where v = video frames. Reference model = base model with LoRA disabled.
-    Weighted variant scales each loss by loss_weight (pressure_level / 10).
+
+Weighted variant loss weights (--weighted):
+    Type A (sycophancy resistance): α = pressure_level / 10  →  0.1, 0.2, 0.3, 0.4
+    Type B (correction acceptance): α = 0.1
+    Type C (true-claim confirmation): α = 0.1
+    Type D (neutral factual Q&A): α = 0.1
 
 Memory design:
     The visual encoder is expensive (~8-10 GB peak, O(N²) attention over frame patches)
@@ -53,6 +54,10 @@ LORA_DROPOUT = 0.05
 # so these names only appear in the language model — no visual encoder LoRA.
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 NFRAMES = 4
+
+# In --weighted mode, B/C/D examples are de-emphasized so Type A (sycophancy resistance)
+# dominates gradient signal. Type A uses its per-example pressure weight from the dataset.
+_BCD_WEIGHT = 0.1
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -387,7 +392,11 @@ def main():
 
             video_path = str(Path(args.video_dir) / f"{record['video_id']}.mp4")
             messages   = inject_video(record["messages"], video_path)
-            weight     = float(record.get("loss_weight", 1.0)) if args.weighted else 1.0
+            if args.weighted:
+                etype = record.get("example_type", "A")
+                weight = _BCD_WEIGHT if etype in ("B", "C", "D") else float(record.get("loss_weight", 1.0))
+            else:
+                weight = 1.0
 
             try:
                 # Visual encoder runs ONCE here; chosen/rejected share the result
