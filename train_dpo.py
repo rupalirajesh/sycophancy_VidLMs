@@ -15,7 +15,7 @@ Usage:
     python train_dpo.py --video-dir data/videos --debug      # 5-step smoke test
 
 Colab setup:
-    !pip install "transformers>=4.57.0" "peft>=0.18.0" accelerate \
+    !pip install "transformers>=4.57.0" "peft>=0.18.0" "torchao>=0.16.0" accelerate \
                  qwen-vl-utils wandb datasets -q
 
 DPO loss (per sample):
