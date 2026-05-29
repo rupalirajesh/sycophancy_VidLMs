@@ -44,7 +44,7 @@ LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-NFRAMES = 8   # frames sampled per video
+NFRAMES = 4   # frames sampled per video (8 OOMs on A100 40GB with Qwen3-VL-8B)
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -240,6 +240,8 @@ def main():
     if args.debug:
         args.no_wandb = True
 
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -274,6 +276,7 @@ def main():
         lora_dropout=LORA_DROPOUT, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.print_trainable_parameters()
 
     # ── data ─────────────────────────────────────────────────────────────
@@ -339,6 +342,7 @@ def main():
             with torch.no_grad(), model.disable_adapter():
                 ref_chosen_logps   = get_logps_nograd(model, chosen_batch)
                 ref_rejected_logps = get_logps_nograd(model, rejected_batch)
+            torch.cuda.empty_cache()
 
             # Policy log probs (with gradient)
             policy_chosen_logps   = get_logps_grad(model, chosen_batch)
