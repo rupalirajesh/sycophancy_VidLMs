@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_dpo.py — Video DPO training for Qwen2-VL sycophancy resistance.
+train_dpo.py — Video DPO training for Qwen3-VL sycophancy resistance.
 
 Each training example passes actual video frames to the model so it learns
 to ground its answers in visual evidence rather than text pressure.
@@ -15,7 +15,7 @@ Usage:
     python train_dpo.py --video-dir data/videos --debug      # 5-step smoke test
 
 Colab setup:
-    !pip install transformers==4.45.2 peft==0.12.0 accelerate==0.34.2 \
+    !pip install "transformers>=4.57.0" "peft>=0.18.0" accelerate \
                  qwen-vl-utils wandb datasets -q
 
 DPO loss (per sample):
@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, get_cosine_schedule_with_warmup
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, get_cosine_schedule_with_warmup
 
 LORA_R = 16
 LORA_ALPHA = 32
@@ -222,7 +222,7 @@ def parse_args():
     p.add_argument("--train",      default="output/train.jsonl")
     p.add_argument("--val",        default="output/val.jsonl")
     p.add_argument("--video-dir",  default="data/videos", help="Directory with {video_id}.mp4 files")
-    p.add_argument("--model",      default="Qwen/Qwen2-VL-7B-Instruct")
+    p.add_argument("--model",      default="Qwen/Qwen3-VL-8B-Instruct")
     p.add_argument("--output-dir", default="checkpoints")
     p.add_argument("--weighted",   action="store_true", help="Pressure-weighted DPO")
     p.add_argument("--no-wandb",   action="store_true")
@@ -260,7 +260,7 @@ def main():
 
     # ── model + processor ────────────────────────────────────────────────
     print(f"Loading {args.model}...")
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
     model.config.use_cache = False
