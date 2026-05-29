@@ -153,7 +153,17 @@ def get_logps_nograd(model, batch: dict) -> torch.Tensor:
 
 
 def get_logps_grad(model, batch: dict) -> torch.Tensor:
-    return _get_logps(model, batch)
+    # Detach visual encoder output so its intermediate activations are freed after
+    # the forward pass instead of being held for backward. The visual encoder is
+    # frozen (no LoRA), so gradients never need to flow through it anyway.
+    visual_enc = model.base_model.model.model.visual
+    handle = visual_enc.register_forward_hook(
+        lambda m, inp, out: out.detach() if isinstance(out, torch.Tensor) else out
+    )
+    try:
+        return _get_logps(model, batch)
+    finally:
+        handle.remove()
 
 
 def _get_logps(model, batch: dict) -> torch.Tensor:
