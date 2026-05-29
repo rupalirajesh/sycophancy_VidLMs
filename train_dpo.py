@@ -44,7 +44,7 @@ LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-NFRAMES = 4   # frames sampled per video (8 OOMs on A100 40GB with Qwen3-VL-8B)
+NFRAMES = 2   # frames sampled per video (more OOMs on A100 40GB with Qwen3-VL-8B)
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -97,41 +97,39 @@ def inject_video(messages: list[dict], video_path: str) -> list[dict]:
 
 # ── forward pass helpers ──────────────────────────────────────────────────────
 
-def process_example(processor, messages_with_video: list[dict], response_text: str, device):
+def encode_prompt(processor, messages_with_video: list[dict]):
     """
-    Tokenize prompt (with video) + response.
-    Returns tensors ready for model.forward(), with labels = -100 on prompt tokens.
+    Decode video frames and tokenize the prompt once.
+    Returns (prompt_enc, prompt_len) — shared by chosen and rejected.
     """
     from qwen_vl_utils import process_vision_info
-
     prompt_str = processor.apply_chat_template(
         messages_with_video, tokenize=False, add_generation_prompt=True
     )
     _, video_inputs = process_vision_info(messages_with_video)
-
-    # Tokenize prompt with video → gets input_ids including visual placeholder tokens
     prompt_enc = processor(
         text=[prompt_str],
         videos=video_inputs if video_inputs else None,
         return_tensors="pt",
         padding=False,
     )
-    prompt_len = prompt_enc["input_ids"].shape[1]
+    return prompt_enc, prompt_enc["input_ids"].shape[1]
 
-    # Tokenize response only (no special tokens)
+
+def build_batch(prompt_enc, prompt_len: int, processor, response_text: str, device) -> dict:
+    """
+    Build a full-sequence batch by appending a response to a pre-encoded prompt.
+    Video tensors are shared (same tensor object) — not copied — to halve GPU memory.
+    """
     resp_ids = processor.tokenizer(
-        response_text,
-        return_tensors="pt",
-        add_special_tokens=False,
-    )["input_ids"]  # (1, resp_len)
-
-    # Append EOS
+        response_text, return_tensors="pt", add_special_tokens=False
+    )["input_ids"]
     eos = torch.tensor([[processor.tokenizer.eos_token_id]])
     resp_ids = torch.cat([resp_ids, eos], dim=1)
 
-    full_ids = torch.cat([prompt_enc["input_ids"], resp_ids], dim=1)
+    full_ids  = torch.cat([prompt_enc["input_ids"], resp_ids], dim=1)
     attn_mask = torch.ones_like(full_ids)
-    labels = torch.full_like(full_ids, -100)
+    labels    = torch.full_like(full_ids, -100)
     labels[0, prompt_len:] = resp_ids[0]
 
     batch = {
@@ -139,10 +137,10 @@ def process_example(processor, messages_with_video: list[dict], response_text: s
         "attention_mask": attn_mask.to(device),
         "labels":         labels.to(device),
     }
+    # Share video tensors — both chosen and rejected use the same video frames
     for key in ("pixel_values_videos", "video_grid_thw"):
         if key in prompt_enc:
             batch[key] = prompt_enc[key].to(device)
-
     return batch
 
 
@@ -332,8 +330,11 @@ def main():
             weight     = float(record.get("loss_weight", 1.0)) if args.weighted else 1.0
 
             try:
-                chosen_batch   = process_example(processor, messages, record["chosen"],   device)
-                rejected_batch = process_example(processor, messages, record["rejected"], device)
+                # Encode video + prompt once; share tensor for chosen and rejected
+                prompt_enc, prompt_len = encode_prompt(processor, messages)
+                chosen_batch   = build_batch(prompt_enc, prompt_len, processor, record["chosen"],   device)
+                rejected_batch = build_batch(prompt_enc, prompt_len, processor, record["rejected"], device)
+                del prompt_enc
             except Exception as e:
                 print(f"  [skip] processing error for {record['video_id']}: {e}")
                 continue
@@ -347,6 +348,7 @@ def main():
             # Policy log probs (with gradient)
             policy_chosen_logps   = get_logps_grad(model, chosen_batch)
             policy_rejected_logps = get_logps_grad(model, rejected_batch)
+            del chosen_batch, rejected_batch
 
             loss = dpo_loss(
                 policy_chosen_logps, policy_rejected_logps,
@@ -384,14 +386,17 @@ def main():
                         vpath = str(Path(args.video_dir) / f"{val_record['video_id']}.mp4")
                         vmsg  = inject_video(val_record["messages"], vpath)
                         try:
-                            cb = process_example(processor, vmsg, val_record["chosen"],   device)
-                            rb = process_example(processor, vmsg, val_record["rejected"], device)
+                            pe, pl = encode_prompt(processor, vmsg)
+                            cb = build_batch(pe, pl, processor, val_record["chosen"],   device)
+                            rb = build_batch(pe, pl, processor, val_record["rejected"], device)
+                            del pe
                             with torch.no_grad():
                                 with model.disable_adapter():
                                     rc = get_logps_nograd(model, cb)
                                     rr = get_logps_nograd(model, rb)
                                 pc = get_logps_nograd(model, cb)
                                 pr = get_logps_nograd(model, rb)
+                            del cb, rb
                             eval_loss += dpo_loss(pc, pr, rc, rr, beta=args.beta).item()
                         except Exception:
                             pass
