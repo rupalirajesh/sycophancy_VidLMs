@@ -375,8 +375,9 @@ def main():
     print(f"\nStarting training — {total_steps} optimizer steps "
           f"({len(train_ds)} examples × {args.epochs} epochs ÷ {args.grad_accum} accum)\n")
 
-    global_step = 0
-    accum_loss  = 0.0
+    global_step          = 0
+    accum_loss           = 0.0
+    accum_reward_margin  = 0.0
     optimizer.zero_grad()
 
     for epoch in range(args.epochs):
@@ -402,24 +403,39 @@ def main():
                 print(f"  [skip] processing error for {record['video_id']}: {e}")
                 continue
 
-            # Reference log probs — no gradient, LoRA disabled
-            with torch.no_grad(), model.disable_adapter():
-                ref_chosen_logps   = get_logps_nograd(model, chosen_batch)
-                ref_rejected_logps = get_logps_nograd(model, rejected_batch)
+            # ── 4 no-grad passes: reference log-probs + policy approximations ──
+            # The policy approximations are identical to the gradient passes
+            # (weights haven't changed), so we use them to derive the gradient
+            # scaling factor g, letting us backprop one graph at a time.
+            with torch.no_grad():
+                with model.disable_adapter():
+                    ref_chosen_logps   = _get_logps(model, chosen_batch)
+                    ref_rejected_logps = _get_logps(model, rejected_batch)
+                pc_approx = _get_logps(model, chosen_batch)
+                pr_approx = _get_logps(model, rejected_batch)
+
             torch.cuda.empty_cache()
 
-            # Policy log probs — with gradient through LM only
-            policy_chosen_logps   = _get_logps(model, chosen_batch)
-            policy_rejected_logps = _get_logps(model, rejected_batch)
-            del chosen_batch, rejected_batch
+            # Gradient scale: ∂(-log σ(β·m))/∂logp_c = -β(1-σ), /∂logp_r = +β(1-σ)
+            margin    = (pc_approx - pr_approx) - (ref_chosen_logps - ref_rejected_logps)
+            loss_val  = float(-F.logsigmoid(args.beta * margin) * weight)
+            g = (args.beta * (1 - torch.sigmoid(args.beta * margin))
+                 * weight / args.grad_accum).detach()
+            accum_reward_margin += float(margin)
+            accum_loss          += loss_val
+            del pc_approx, pr_approx, margin
 
-            loss = dpo_loss(
-                policy_chosen_logps, policy_rejected_logps,
-                ref_chosen_logps,    ref_rejected_logps,
-                beta=args.beta, weight=weight,
-            )
-            (loss / args.grad_accum).backward()
-            accum_loss += loss.item()
+            # ── 2 grad passes, one at a time — never hold both graphs ──
+            policy_chosen_logps = _get_logps(model, chosen_batch)
+            del chosen_batch
+            policy_chosen_logps.backward(-g)
+            del policy_chosen_logps
+            torch.cuda.empty_cache()
+
+            policy_rejected_logps = _get_logps(model, rejected_batch)
+            del rejected_batch
+            policy_rejected_logps.backward(g)
+            del policy_rejected_logps
 
             if (local_step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -427,26 +443,25 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-                accum_loss /= args.grad_accum
+                accum_loss          /= args.grad_accum
+                accum_reward_margin /= args.grad_accum
 
-                reward_margin = float(
-                    (policy_chosen_logps - ref_chosen_logps
-                     - policy_rejected_logps + ref_rejected_logps).mean().detach()
-                )
                 print(f"  step {global_step}/{max_steps}  loss={accum_loss:.4f}  "
-                      f"reward_margin={reward_margin:.4f}  "
+                      f"reward_margin={accum_reward_margin:.4f}  "
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
                 if not args.no_wandb:
                     import wandb
                     wandb.log({
-                        "train_loss": accum_loss,
-                        "reward_margin": reward_margin,
-                        "lr": scheduler.get_last_lr()[0],
+                        "train_loss":    accum_loss,
+                        "reward_margin": accum_reward_margin,
+                        "lr":            scheduler.get_last_lr()[0],
                     }, step=global_step)
 
-                loss_log.add(global_step, train_loss=accum_loss, reward_margin=reward_margin)
-                accum_loss = 0.0
+                loss_log.add(global_step, train_loss=accum_loss,
+                             reward_margin=accum_reward_margin)
+                accum_loss          = 0.0
+                accum_reward_margin = 0.0
 
                 # Eval every 100 steps
                 if global_step % 100 == 0 or global_step == max_steps:
