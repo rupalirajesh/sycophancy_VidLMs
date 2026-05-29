@@ -85,7 +85,7 @@ def inject_video(messages: list[dict], video_path: str) -> list[dict]:
             result.append({
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": video_path, "nframes": NFRAMES, "fps": 1.0},
+                    {"type": "video", "video": video_path, "nframes": NFRAMES},
                     {"type": "text",  "text": m["content"]},
                 ],
             })
