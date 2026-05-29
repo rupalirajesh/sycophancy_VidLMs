@@ -244,7 +244,7 @@ def main():
     random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen2vl-video"
+    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen3vl-video"
     if args.debug:
         run_name += "-debug"
     out_dir = Path(args.output_dir) / run_name
