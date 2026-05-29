@@ -43,10 +43,10 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, get_
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-# Regex targets only language-model layers (model.model.layers.*), not the visual encoder.
-# Sycophancy is a language-model behaviour; keeping the visual encoder frozen also
-# avoids its O(N²) attention activations being stored for LoRA backward.
-LORA_TARGETS = r"model\.layers\.\d+\.(self_attn|mlp)\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+# Target only attention projections. The visual encoder uses a combined `qkv` Linear,
+# so q_proj/k_proj/v_proj/o_proj only exist in the language model — no regex needed.
+# gate_proj/up_proj/down_proj exist in both LM and visual encoder MLP, so we skip them.
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
 NFRAMES = 4   # 8 frames OOMs on A100 40GB; 4 is sufficient for weather/motion/counting
 
 
