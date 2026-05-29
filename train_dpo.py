@@ -24,15 +24,21 @@ DPO loss (per sample):
 
     where v = video frames. Reference model = base model with LoRA disabled.
     Weighted variant scales each loss by loss_weight (pressure_level / 10).
+
+Memory design:
+    The visual encoder is expensive (~8-10 GB peak, O(N²) attention over frame patches)
+    and its output is identical for policy and reference models (LoRA only touches the LM).
+    We therefore run it ONCE per training example under no_grad, merge the result into
+    inputs_embeds, and pass that tensor to all four forward passes (ref_chosen,
+    ref_rejected, policy_chosen, policy_rejected). This cuts visual encoder calls from
+    4 to 1, fitting comfortably on an A100 40 GB.
 """
 
 import argparse
 import json
 import os
 import random
-from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -43,11 +49,10 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, get_
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-# Target only attention projections. The visual encoder uses a combined `qkv` Linear,
-# so q_proj/k_proj/v_proj/o_proj only exist in the language model — no regex needed.
-# gate_proj/up_proj/down_proj exist in both LM and visual encoder MLP, so we skip them.
+# Target only LM attention projections. The visual encoder uses a combined `qkv` Linear,
+# so these names only appear in the language model — no visual encoder LoRA.
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
-NFRAMES = 4   # 8 frames OOMs on A100 40GB; 4 is sufficient for weather/motion/counting
+NFRAMES = 4
 
 
 # ── dataset ───────────────────────────────────────────────────────────────────
@@ -100,12 +105,23 @@ def inject_video(messages: list[dict], video_path: str) -> list[dict]:
 
 # ── forward pass helpers ──────────────────────────────────────────────────────
 
-def encode_prompt(processor, messages_with_video: list[dict]):
+def _base_model(model):
+    """Unwrap PeftModel to get Qwen2_5_VLForConditionalGeneration."""
+    return model.base_model.model if hasattr(model, "base_model") else model
+
+
+def encode_prompt_embeds(model, processor, messages_with_video: list[dict], device):
     """
-    Decode video frames and tokenize the prompt once.
-    Returns (prompt_enc, prompt_len) — shared by chosen and rejected.
+    Tokenize the prompt and pre-compute visual embeddings in one shot.
+
+    Runs the visual encoder ONCE under no_grad, merges video token embeddings
+    into the text token embeddings, and returns:
+      - prompt_enc   : raw processor output (kept for input_ids / video_grid_thw)
+      - prompt_embeds: (1, prompt_len, D) tensor with video already merged, detached
+      - prompt_len   : number of prompt tokens
     """
     from qwen_vl_utils import process_vision_info
+
     prompt_str = processor.apply_chat_template(
         messages_with_video, tokenize=False, add_generation_prompt=True
     )
@@ -116,13 +132,40 @@ def encode_prompt(processor, messages_with_video: list[dict]):
         return_tensors="pt",
         padding=False,
     )
-    return prompt_enc, prompt_enc["input_ids"].shape[1]
+    prompt_len = prompt_enc["input_ids"].shape[1]
+
+    base = _base_model(model)
+    input_ids = prompt_enc["input_ids"].to(device)
+
+    with torch.no_grad():
+        embeds = base.model.embed_tokens(input_ids)  # (1, prompt_len, D)
+
+        if "pixel_values_videos" in prompt_enc:
+            pv   = prompt_enc["pixel_values_videos"].to(device)
+            grid = prompt_enc["video_grid_thw"].to(device)
+            # Run visual encoder exactly once — this is the expensive step
+            video_embeds = base.model.visual(pv, grid_thw=grid)
+            video_mask = (
+                (input_ids == base.config.video_token_id)
+                .unsqueeze(-1)
+                .expand_as(embeds)
+            )
+            embeds = embeds.masked_scatter(video_mask, video_embeds)
+            del pv, video_embeds
+
+    return prompt_enc, embeds.detach(), prompt_len
 
 
-def build_batch(prompt_enc, prompt_len: int, processor, response_text: str, device) -> dict:
+def build_batch(
+    prompt_enc, prompt_embeds: torch.Tensor, prompt_len: int,
+    model, processor, response_text: str, device,
+) -> dict:
     """
-    Build a full-sequence batch by appending a response to a pre-encoded prompt.
-    Video tensors are shared (same tensor object) — not copied — to halve GPU memory.
+    Build a full-sequence batch by appending a response to the pre-computed prompt.
+
+    - prompt_embeds already has video tokens merged (computed in encode_prompt_embeds)
+    - response token embeddings are a cheap lookup, done here under no_grad
+    - video_grid_thw is retained so M-RoPE assigns correct temporal positions
     """
     resp_ids = processor.tokenizer(
         response_text, return_tensors="pt", add_special_tokens=False
@@ -135,59 +178,60 @@ def build_batch(prompt_enc, prompt_len: int, processor, response_text: str, devi
     labels    = torch.full_like(full_ids, -100)
     labels[0, prompt_len:] = resp_ids[0]
 
+    base = _base_model(model)
+    with torch.no_grad():
+        resp_embeds = base.model.embed_tokens(resp_ids.to(device))  # (1, resp_len, D)
+
+    full_embeds = torch.cat([prompt_embeds, resp_embeds.detach()], dim=1)
+
     batch = {
         "input_ids":      full_ids.to(device),
         "attention_mask": attn_mask.to(device),
         "labels":         labels.to(device),
+        "inputs_embeds":  full_embeds,
     }
-    # Share video tensors — both chosen and rejected use the same video frames
-    for key in ("pixel_values_videos", "video_grid_thw"):
-        if key in prompt_enc:
-            batch[key] = prompt_enc[key].to(device)
+    # video_grid_thw is needed by get_rope_index for M-RoPE temporal positions.
+    # pixel_values_videos is intentionally NOT included — the visual encoder must
+    # not run again (embeddings are already merged into inputs_embeds).
+    if "video_grid_thw" in prompt_enc:
+        batch["video_grid_thw"] = prompt_enc["video_grid_thw"].to(device)
+
     return batch
 
 
-@torch.no_grad()
-def get_logps_nograd(model, batch: dict) -> torch.Tensor:
-    return _get_logps(model, batch)
-
-
-def get_logps_grad(model, batch: dict) -> torch.Tensor:
-    # Detach visual encoder output so its intermediate activations are freed after
-    # the forward pass instead of being held for backward. The visual encoder is
-    # frozen (no LoRA), so gradients never need to flow through it anyway.
-    visual_enc = model.base_model.model.model.visual
-    handle = visual_enc.register_forward_hook(
-        lambda m, inp, out: out.detach() if isinstance(out, torch.Tensor) else out
-    )
-    try:
-        return _get_logps(model, batch)
-    finally:
-        handle.remove()
-
-
 def _get_logps(model, batch: dict) -> torch.Tensor:
-    """Sum of log probs over response tokens (where labels != -100)."""
-    vision_kwargs = {}
-    for key in ("pixel_values_videos", "video_grid_thw"):
+    """
+    Sum of log probs over response tokens.
+
+    Passes inputs_embeds (visual encoder already baked in) + input_ids
+    (needed for M-RoPE position computation) + video_grid_thw (for temporal RoPE).
+    The visual encoder is never called here.
+    """
+    extra = {}
+    for key in ("inputs_embeds", "video_grid_thw"):
         if key in batch:
-            vision_kwargs[key] = batch[key]
+            extra[key] = batch[key]
 
     outputs = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
-        **vision_kwargs,
+        **extra,
     )
     logits = outputs.logits[:, :-1].float()        # (B, seq-1, vocab)
     shifted_labels = batch["labels"][:, 1:]        # (B, seq-1)
 
-    log_probs = F.log_softmax(logits, dim=-1)
+    log_probs  = F.log_softmax(logits, dim=-1)
     token_logps = torch.gather(
         log_probs, 2, shifted_labels.clamp(min=0).unsqueeze(2)
     ).squeeze(2)
 
     mask = shifted_labels != -100
     return (token_logps * mask).sum(-1)            # (B,)
+
+
+@torch.no_grad()
+def get_logps_nograd(model, batch: dict) -> torch.Tensor:
+    return _get_logps(model, batch)
 
 
 # ── DPO loss ──────────────────────────────────────────────────────────────────
@@ -309,7 +353,6 @@ def main():
             f"and run download_videos.py first."
         )
 
-    # DataLoader with shuffle; collate_fn is identity (we process one at a time)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=lambda x: x[0])
     val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
 
@@ -318,12 +361,12 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=0.01,
     )
-    total_steps = (len(train_ds) * args.epochs) // args.grad_accum
+    total_steps  = (len(train_ds) * args.epochs) // args.grad_accum
     warmup_steps = max(1, int(0.05 * total_steps))
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scheduler    = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     max_steps = 5 if args.debug else total_steps
-    loss_log = LossLog(str(out_dir / "loss_log.json"))
+    loss_log  = LossLog(str(out_dir / "loss_log.json"))
 
     # ── training loop ─────────────────────────────────────────────────────
     print(f"\nStarting training — {total_steps} optimizer steps "
@@ -343,24 +386,28 @@ def main():
             weight     = float(record.get("loss_weight", 1.0)) if args.weighted else 1.0
 
             try:
-                # Encode video + prompt once; share tensor for chosen and rejected
-                prompt_enc, prompt_len = encode_prompt(processor, messages)
-                chosen_batch   = build_batch(prompt_enc, prompt_len, processor, record["chosen"],   device)
-                rejected_batch = build_batch(prompt_enc, prompt_len, processor, record["rejected"], device)
-                del prompt_enc
+                # Visual encoder runs ONCE here; chosen/rejected share the result
+                prompt_enc, prompt_embeds, prompt_len = encode_prompt_embeds(
+                    model, processor, messages, device
+                )
+                chosen_batch   = build_batch(prompt_enc, prompt_embeds, prompt_len,
+                                             model, processor, record["chosen"],   device)
+                rejected_batch = build_batch(prompt_enc, prompt_embeds, prompt_len,
+                                             model, processor, record["rejected"], device)
+                del prompt_enc, prompt_embeds
             except Exception as e:
                 print(f"  [skip] processing error for {record['video_id']}: {e}")
                 continue
 
-            # Reference log probs (no gradient, LoRA disabled)
+            # Reference log probs — no gradient, LoRA disabled
             with torch.no_grad(), model.disable_adapter():
                 ref_chosen_logps   = get_logps_nograd(model, chosen_batch)
                 ref_rejected_logps = get_logps_nograd(model, rejected_batch)
             torch.cuda.empty_cache()
 
-            # Policy log probs (with gradient)
-            policy_chosen_logps   = get_logps_grad(model, chosen_batch)
-            policy_rejected_logps = get_logps_grad(model, rejected_batch)
+            # Policy log probs — with gradient through LM only
+            policy_chosen_logps   = _get_logps(model, chosen_batch)
+            policy_rejected_logps = _get_logps(model, rejected_batch)
             del chosen_batch, rejected_batch
 
             loss = dpo_loss(
@@ -371,7 +418,6 @@ def main():
             (loss / args.grad_accum).backward()
             accum_loss += loss.item()
 
-            # Optimizer step every grad_accum examples
             if (local_step + 1) % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -380,29 +426,38 @@ def main():
                 global_step += 1
                 accum_loss /= args.grad_accum
 
+                reward_margin = float(
+                    (policy_chosen_logps - ref_chosen_logps
+                     - policy_rejected_logps + ref_rejected_logps).mean().detach()
+                )
                 print(f"  step {global_step}/{max_steps}  loss={accum_loss:.4f}  "
+                      f"reward_margin={reward_margin:.4f}  "
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
                 if not args.no_wandb:
                     import wandb
-                    wandb.log({"train_loss": accum_loss, "lr": scheduler.get_last_lr()[0]}, step=global_step)
+                    wandb.log({
+                        "train_loss": accum_loss,
+                        "reward_margin": reward_margin,
+                        "lr": scheduler.get_last_lr()[0],
+                    }, step=global_step)
 
-                loss_log.add(global_step, train_loss=accum_loss)
+                loss_log.add(global_step, train_loss=accum_loss, reward_margin=reward_margin)
                 accum_loss = 0.0
 
                 # Eval every 100 steps
                 if global_step % 100 == 0 or global_step == max_steps:
                     model.eval()
-                    eval_loss = 0.0
+                    eval_loss  = 0.0
                     eval_steps = min(50, len(val_ds))
                     for val_record in list(val_loader)[:eval_steps]:
                         vpath = str(Path(args.video_dir) / f"{val_record['video_id']}.mp4")
                         vmsg  = inject_video(val_record["messages"], vpath)
                         try:
-                            pe, pl = encode_prompt(processor, vmsg)
-                            cb = build_batch(pe, pl, processor, val_record["chosen"],   device)
-                            rb = build_batch(pe, pl, processor, val_record["rejected"], device)
-                            del pe
+                            pe, pe_emb, pl = encode_prompt_embeds(model, processor, vmsg, device)
+                            cb = build_batch(pe, pe_emb, pl, model, processor, val_record["chosen"],   device)
+                            rb = build_batch(pe, pe_emb, pl, model, processor, val_record["rejected"], device)
+                            del pe, pe_emb
                             with torch.no_grad():
                                 with model.disable_adapter():
                                     rc = get_logps_nograd(model, cb)
