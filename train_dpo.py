@@ -1,354 +1,425 @@
 #!/usr/bin/env python3
 """
-train_dpo.py — DPO / Pressure-Weighted DPO training for sycophancy resistance
+train_dpo.py — Video DPO training for Qwen2-VL sycophancy resistance.
 
-Two training runs (run sequentially or in separate Colab sessions):
+Each training example passes actual video frames to the model so it learns
+to ground its answers in visual evidence rather than text pressure.
 
-    Standard DPO:
-        python train_dpo.py --train output/train.jsonl --val output/val.jsonl
+Usage:
+    python train_dpo.py \
+        --video-dir data/videos \
+        --train output/train.jsonl \
+        --val   output/val.jsonl
 
-    Pressure-weighted DPO:
-        python train_dpo.py --train output/train.jsonl --val output/val.jsonl --weighted
-
-Each run opens a W&B link for live loss curves. Progress is also saved to
-checkpoints/<run_name>/loss_log.json every 10 steps.
+    python train_dpo.py --video-dir data/videos --weighted   # pressure-weighted variant
+    python train_dpo.py --video-dir data/videos --debug      # 5-step smoke test
 
 Colab setup:
-    !pip install transformers==4.45.2 trl==0.11.4 peft==0.12.0 \
-                 accelerate==0.34.2 wandb datasets -q
+    !pip install transformers==4.45.2 peft==0.12.0 accelerate==0.34.2 \
+                 qwen-vl-utils wandb datasets -q
 
-NOTE: This trains on text descriptions (scene_desc embedded in messages).
-      To use actual video frames, replace `messages` with Qwen2VL visual inputs.
+DPO loss (per sample):
+    L = -log sigmoid( beta * ((log π(chosen|x,v) - log π_ref(chosen|x,v))
+                             - (log π(rejected|x,v) - log π_ref(rejected|x,v))) )
+
+    where v = video frames. Reference model = base model with LoRA disabled.
+    Weighted variant scales each loss by loss_weight (pressure_level / 10).
 """
 
 import argparse
 import json
 import os
-from dataclasses import dataclass
+import random
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import torch
-from datasets import Dataset
+import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
-from transformers import (
-    AutoProcessor,
-    Qwen2VLForConditionalGeneration,
-    TrainerCallback,
-    TrainerControl,
-    TrainerState,
-    TrainingArguments,
-)
-from trl import DPOConfig, DPOTrainer
-
-# ── LoRA config ──────────────────────────────────────────────────────────────
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, get_cosine_schedule_with_warmup
 
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-LORA_TARGETS = [
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
-]
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+NFRAMES = 8   # frames sampled per video
 
 
-# ── data helpers ─────────────────────────────────────────────────────────────
+# ── dataset ───────────────────────────────────────────────────────────────────
 
 def load_jsonl(path: str) -> list[dict]:
     with open(path) as f:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def build_dataset(records: list[dict], processor, include_weights: bool) -> Dataset:
-    """Convert JSONL records to a HuggingFace Dataset for DPOTrainer.
+class VideoPreferenceDataset(Dataset):
+    def __init__(self, records: list[dict], video_dir: str, skip_missing: bool = True):
+        self.video_dir = Path(video_dir)
+        self.records = []
+        missing = 0
+        for r in records:
+            vpath = self.video_dir / f"{r['video_id']}.mp4"
+            if not vpath.exists():
+                missing += 1
+                if skip_missing:
+                    continue
+            self.records.append(r)
+        if missing:
+            print(f"  Skipped {missing} records with missing video files.")
 
-    TRL expects: prompt (str), chosen (str), rejected (str).
-    The prompt is the full conversation up to the last user turn,
-    formatted with the model's chat template.
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        return self.records[idx]
+
+
+def inject_video(messages: list[dict], video_path: str) -> list[dict]:
+    """Insert the video into the first user message as a multimodal content block."""
+    result = []
+    video_injected = False
+    for m in messages:
+        if m["role"] == "user" and not video_injected:
+            result.append({
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": video_path, "nframes": NFRAMES, "fps": 1.0},
+                    {"type": "text",  "text": m["content"]},
+                ],
+            })
+            video_injected = True
+        else:
+            result.append(m)
+    return result
+
+
+# ── forward pass helpers ──────────────────────────────────────────────────────
+
+def process_example(processor, messages_with_video: list[dict], response_text: str, device):
     """
-    rows = []
-    for r in records:
-        prompt = processor.tokenizer.apply_chat_template(
-            r["messages"],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        row = {
-            "prompt": prompt,
-            "chosen": r["chosen"],
-            "rejected": r["rejected"],
-        }
-        if include_weights:
-            row["loss_weight"] = float(r.get("loss_weight", 1.0))
-        rows.append(row)
-    return Dataset.from_list(rows)
-
-
-# ── text-only DPO base ───────────────────────────────────────────────────────
-
-class TextOnlyDPOTrainer(DPOTrainer):
-    """Forces text-only mode even when a VLM processor is passed.
-
-    TRL sets is_vision_model=True when it sees Qwen2VLProcessor (which has an
-    image_processor attribute), then unconditionally looks for pixel_values in
-    every batch. Our dataset is text-only, so we override the flag after init.
+    Tokenize prompt (with video) + response.
+    Returns tensors ready for model.forward(), with labels = -100 on prompt tokens.
     """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.is_vision_model = False
+    from qwen_vl_utils import process_vision_info
+
+    prompt_str = processor.apply_chat_template(
+        messages_with_video, tokenize=False, add_generation_prompt=True
+    )
+    _, video_inputs = process_vision_info(messages_with_video)
+
+    # Tokenize prompt with video → gets input_ids including visual placeholder tokens
+    prompt_enc = processor(
+        text=[prompt_str],
+        videos=video_inputs if video_inputs else None,
+        return_tensors="pt",
+        padding=False,
+    )
+    prompt_len = prompt_enc["input_ids"].shape[1]
+
+    # Tokenize response only (no special tokens)
+    resp_ids = processor.tokenizer(
+        response_text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"]  # (1, resp_len)
+
+    # Append EOS
+    eos = torch.tensor([[processor.tokenizer.eos_token_id]])
+    resp_ids = torch.cat([resp_ids, eos], dim=1)
+
+    full_ids = torch.cat([prompt_enc["input_ids"], resp_ids], dim=1)
+    attn_mask = torch.ones_like(full_ids)
+    labels = torch.full_like(full_ids, -100)
+    labels[0, prompt_len:] = resp_ids[0]
+
+    batch = {
+        "input_ids":      full_ids.to(device),
+        "attention_mask": attn_mask.to(device),
+        "labels":         labels.to(device),
+    }
+    for key in ("pixel_values_videos", "video_grid_thw"):
+        if key in prompt_enc:
+            batch[key] = prompt_enc[key].to(device)
+
+    return batch
 
 
-# ── weighted DPO ─────────────────────────────────────────────────────────────
-
-@dataclass
-class WeightedDPOCollator:
-    """Wraps TRL's default DPO collator to pass loss_weight through to the batch."""
-    base: Any
-
-    def __call__(self, features: list[dict]) -> dict:
-        weights = [float(f.pop("loss_weight", 1.0)) for f in features]
-        batch = self.base(features)
-        batch["loss_weight"] = torch.tensor(weights, dtype=torch.float32)
-        return batch
+@torch.no_grad()
+def get_logps_nograd(model, batch: dict) -> torch.Tensor:
+    return _get_logps(model, batch)
 
 
-class WeightedDPOTrainer(TextOnlyDPOTrainer):
-    """DPO trainer that scales each sample's loss by loss_weight.
-
-    Pressure-level mapping: p1→0.1, p2→0.2, p3→0.3, p4→0.4, B/C/D→1.0.
-    High-pressure sycophancy events get proportionally more gradient signal.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Wrap the collator so loss_weight reaches the batch dict
-        self.data_collator = WeightedDPOCollator(base=self.data_collator)
-        self._batch_weights: Optional[torch.Tensor] = None
-
-    def tokenize_row(self, feature, model=None):
-        """Preserve loss_weight through TRL's tokenization step."""
-        result = super().tokenize_row(feature, model=model)
-        result["loss_weight"] = feature.get("loss_weight", 1.0)
-        return result
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Pop weights before parent's forward pass so model.forward() never sees them
-        w = inputs.pop("loss_weight", None)
-        if w is not None:
-            self._batch_weights = (
-                w if isinstance(w, torch.Tensor)
-                else torch.tensor(w, dtype=torch.float32)
-            )
-        return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
-
-    def dpo_loss(
-        self,
-        policy_chosen_logps: torch.Tensor,
-        policy_rejected_logps: torch.Tensor,
-        reference_chosen_logps: torch.Tensor,
-        reference_rejected_logps: torch.Tensor,
-    ):
-        # Parent returns per-sample losses (before .mean())
-        losses, chosen_rewards, rejected_rewards = super().dpo_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            reference_chosen_logps,
-            reference_rejected_logps,
-        )
-        if self._batch_weights is not None:
-            w = self._batch_weights.to(device=losses.device, dtype=losses.dtype)
-            losses = losses * w
-            self._batch_weights = None
-        return losses, chosen_rewards, rejected_rewards
+def get_logps_grad(model, batch: dict) -> torch.Tensor:
+    return _get_logps(model, batch)
 
 
-# ── loss logging callback ─────────────────────────────────────────────────────
+def _get_logps(model, batch: dict) -> torch.Tensor:
+    """Sum of log probs over response tokens (where labels != -100)."""
+    vision_kwargs = {}
+    for key in ("pixel_values_videos", "video_grid_thw"):
+        if key in batch:
+            vision_kwargs[key] = batch[key]
 
-class LossLogCallback(TrainerCallback):
-    """Saves loss to loss_log.json every `save_every` steps.
+    outputs = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        **vision_kwargs,
+    )
+    logits = outputs.logits[:, :-1].float()        # (B, seq-1, vocab)
+    shifted_labels = batch["labels"][:, 1:]        # (B, seq-1)
 
-    Use plot_loss.py to visualize mid-run or after training completes.
-    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_logps = torch.gather(
+        log_probs, 2, shifted_labels.clamp(min=0).unsqueeze(2)
+    ).squeeze(2)
 
-    def __init__(self, path: str, save_every: int = 10):
+    mask = shifted_labels != -100
+    return (token_logps * mask).sum(-1)            # (B,)
+
+
+# ── DPO loss ──────────────────────────────────────────────────────────────────
+
+def dpo_loss(
+    policy_chosen_logps: torch.Tensor,
+    policy_rejected_logps: torch.Tensor,
+    ref_chosen_logps: torch.Tensor,
+    ref_rejected_logps: torch.Tensor,
+    beta: float,
+    weight: float = 1.0,
+) -> torch.Tensor:
+    pi_logratios  = policy_chosen_logps  - policy_rejected_logps
+    ref_logratios = ref_chosen_logps     - ref_rejected_logps
+    loss = -F.logsigmoid(beta * (pi_logratios - ref_logratios))
+    return loss.mean() * weight
+
+
+# ── loss logger ───────────────────────────────────────────────────────────────
+
+class LossLog:
+    def __init__(self, path: str):
         self.path = path
-        self.save_every = save_every
         self._log: list[dict] = []
+
+    def add(self, step: int, **kwargs):
+        self._log.append({"step": step, **{k: round(float(v), 4) for k, v in kwargs.items()}})
+        if step % 10 == 0:
+            self._flush()
 
     def _flush(self):
         with open(self.path, "w") as f:
             json.dump(self._log, f, indent=2)
 
-    def on_log(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        logs: Optional[dict] = None,
-        **kwargs,
-    ):
-        if not logs:
-            return
-        entry = {"step": state.global_step, "epoch": round(state.epoch or 0, 3)}
-        if "loss" in logs:
-            entry["train_loss"] = round(logs["loss"], 4)
-        if "eval_loss" in logs:
-            entry["eval_loss"] = round(logs["eval_loss"], 4)
-        if "rewards/margins" in logs:
-            entry["reward_margin"] = round(logs["rewards/margins"], 4)
-        if entry.keys() - {"step", "epoch"}:  # only save if we have real metrics
-            self._log.append(entry)
-            if state.global_step % self.save_every == 0:
-                self._flush()
-
-    def on_train_end(self, args, state, control, **kwargs):
+    def close(self):
         self._flush()
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="DPO training for sycophancy resistance")
-    p.add_argument("--train", default="output/train.jsonl", help="Training JSONL")
-    p.add_argument("--val", default="output/val.jsonl", help="Validation JSONL")
-    p.add_argument("--model", default="Qwen/Qwen2-VL-7B-Instruct")
+    p = argparse.ArgumentParser()
+    p.add_argument("--train",      default="output/train.jsonl")
+    p.add_argument("--val",        default="output/val.jsonl")
+    p.add_argument("--video-dir",  default="data/videos", help="Directory with {video_id}.mp4 files")
+    p.add_argument("--model",      default="Qwen/Qwen2-VL-7B-Instruct")
     p.add_argument("--output-dir", default="checkpoints")
-    p.add_argument("--weighted", action="store_true",
-                   help="Use pressure-weighted DPO (vs standard DPO)")
-    p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
-    p.add_argument("--epochs", type=int, default=2)
-    p.add_argument("--batch-size", type=int, default=2,
-                   help="Per-device batch size (2 fits A100 40GB with QLoRA)")
-    p.add_argument("--grad-accum", type=int, default=8,
-                   help="Effective batch = batch_size * grad_accum = 16")
-    p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--beta", type=float, default=0.1, help="DPO regularization strength")
-    p.add_argument("--max-length", type=int, default=1024)
-    p.add_argument("--debug", action="store_true",
-                   help="Smoke-test: 50 examples, 5 steps, no save, no W&B")
+    p.add_argument("--weighted",   action="store_true", help="Pressure-weighted DPO")
+    p.add_argument("--no-wandb",   action="store_true")
+    p.add_argument("--debug",      action="store_true", help="5 steps, no save, no W&B")
+    p.add_argument("--epochs",     type=int,   default=2)
+    p.add_argument("--grad-accum", type=int,   default=16, help="Effective batch size")
+    p.add_argument("--lr",         type=float, default=5e-5)
+    p.add_argument("--beta",       type=float, default=0.1)
+    p.add_argument("--seed",       type=int,   default=42)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-
     if args.debug:
         args.no_wandb = True
 
-    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen2vl"
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    run_name = f"{'weighted' if args.weighted else 'standard'}-dpo-qwen2vl-video"
     if args.debug:
         run_name += "-debug"
     out_dir = Path(args.output_dir) / run_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    loss_log_path = str(out_dir / "loss_log.json")
 
-    print(f"\n{'='*60}")
-    print(f"  Run: {run_name}{'  [DEBUG]' if args.debug else ''}")
-    print(f"  Output: {out_dir}")
-    print(f"  Loss log: {loss_log_path}")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}\n  {run_name}\n  Output: {out_dir}\n{'='*60}\n")
 
     # ── W&B ──────────────────────────────────────────────────────────────
     if not args.no_wandb:
         import wandb
         wandb.init(project="sycophancy-dpo", name=run_name, config=vars(args))
-        print(f"W&B run: {wandb.run.url}\n")
+        print(f"W&B: {wandb.run.url}\n")
 
-    # ── model ─────────────────────────────────────────────────────────────
-    # bf16 + LoRA fits comfortably on A100 40GB (~14 GB base, no quantization needed)
-    print(f"Loading {args.model} in bf16 + LoRA mode...")
+    # ── model + processor ────────────────────────────────────────────────
+    print(f"Loading {args.model}...")
     model = Qwen2VLForConditionalGeneration.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
+        args.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
     model.config.use_cache = False
 
     processor = AutoProcessor.from_pretrained(args.model)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "left"  # required for DPO
-    # TRL 0.11 double-unwraps VLM processors: first extracts .tokenizer from the processor,
-    # then calls .tokenizer again on the result. Self-reference prevents the AttributeError.
-    processor.tokenizer.tokenizer = processor.tokenizer
 
     lora_cfg = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        target_modules=LORA_TARGETS,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM",
+        r=LORA_R, lora_alpha=LORA_ALPHA, target_modules=LORA_TARGETS,
+        lora_dropout=LORA_DROPOUT, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # ── dataset ───────────────────────────────────────────────────────────
+    # ── data ─────────────────────────────────────────────────────────────
     print("\nLoading dataset...")
     train_records = load_jsonl(args.train)
-    val_records = load_jsonl(args.val)
+    val_records   = load_jsonl(args.val)
 
     if args.debug:
-        train_records = train_records[:50]
-        val_records = val_records[:20]
-        print("[DEBUG] Truncated to 50 train / 20 val examples")
+        train_records = train_records[:20]
+        val_records   = val_records[:10]
 
-    train_ds = build_dataset(train_records, processor, include_weights=args.weighted)
-    val_ds = build_dataset(val_records, processor, include_weights=args.weighted)
+    train_ds = VideoPreferenceDataset(train_records, args.video_dir)
+    val_ds   = VideoPreferenceDataset(val_records,   args.video_dir)
     print(f"Train: {len(train_ds):,}  |  Val: {len(val_ds):,}")
 
-    # ── training config ───────────────────────────────────────────────────
-    dpo_cfg = DPOConfig(
-        output_dir=str(out_dir),
-        num_train_epochs=1 if args.debug else args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=1 if args.debug else args.grad_accum,
-        learning_rate=args.lr,
-        beta=args.beta,
-        max_length=args.max_length,
-        max_prompt_length=args.max_length // 2,
-        bf16=True,
-        logging_steps=1 if args.debug else 10,
-        eval_strategy="steps",
-        eval_steps=5 if args.debug else 200,
-        save_strategy="no" if args.debug else "steps",
-        save_steps=200,
-        save_total_limit=3,
-        load_best_model_at_end=False,
-        remove_unused_columns=False,   # keep loss_weight column in batch
-        report_to=[] if args.no_wandb else ["wandb"],
-        run_name=run_name,
-        dataloader_num_workers=0,
-        optim="adamw_torch_fused",
-        warmup_ratio=0.05,
-        lr_scheduler_type="cosine",
-        max_steps=5 if args.debug else -1,
+    if len(train_ds) == 0:
+        raise RuntimeError(
+            f"No training examples found. Make sure videos are in {args.video_dir}/ "
+            f"and run download_videos.py first."
+        )
+
+    # DataLoader with shuffle; collate_fn is identity (we process one at a time)
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,  collate_fn=lambda x: x[0])
+    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
+
+    # ── optimizer ────────────────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr, weight_decay=0.01,
     )
+    total_steps = (len(train_ds) * args.epochs) // args.grad_accum
+    warmup_steps = max(1, int(0.05 * total_steps))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    TrainerClass = WeightedDPOTrainer if args.weighted else TextOnlyDPOTrainer
-    trainer = TrainerClass(
-        model=model,
-        ref_model=None,          # PEFT mode: base model is the implicit reference
-        args=dpo_cfg,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        tokenizer=processor,
-        callbacks=[LossLogCallback(loss_log_path, save_every=10)],
-    )
+    max_steps = 5 if args.debug else total_steps
+    loss_log = LossLog(str(out_dir / "loss_log.json"))
 
-    # ── train ─────────────────────────────────────────────────────────────
-    print(f"\nStarting training ({TrainerClass.__name__})...\n")
-    trainer.train()
+    # ── training loop ─────────────────────────────────────────────────────
+    print(f"\nStarting training — {total_steps} optimizer steps "
+          f"({len(train_ds)} examples × {args.epochs} epochs ÷ {args.grad_accum} accum)\n")
 
-    final_path = out_dir / "final"
-    trainer.save_model(str(final_path))
-    processor.save_pretrained(str(final_path))
-    print(f"\nSaved to {final_path}")
-    print(f"Loss log:  {loss_log_path}")
+    global_step = 0
+    accum_loss  = 0.0
+    optimizer.zero_grad()
+
+    for epoch in range(args.epochs):
+        for local_step, record in enumerate(train_loader):
+            if global_step >= max_steps:
+                break
+
+            video_path = str(Path(args.video_dir) / f"{record['video_id']}.mp4")
+            messages   = inject_video(record["messages"], video_path)
+            weight     = float(record.get("loss_weight", 1.0)) if args.weighted else 1.0
+
+            try:
+                chosen_batch   = process_example(processor, messages, record["chosen"],   device)
+                rejected_batch = process_example(processor, messages, record["rejected"], device)
+            except Exception as e:
+                print(f"  [skip] processing error for {record['video_id']}: {e}")
+                continue
+
+            # Reference log probs (no gradient, LoRA disabled)
+            with torch.no_grad(), model.disable_adapter():
+                ref_chosen_logps   = get_logps_nograd(model, chosen_batch)
+                ref_rejected_logps = get_logps_nograd(model, rejected_batch)
+
+            # Policy log probs (with gradient)
+            policy_chosen_logps   = get_logps_grad(model, chosen_batch)
+            policy_rejected_logps = get_logps_grad(model, rejected_batch)
+
+            loss = dpo_loss(
+                policy_chosen_logps, policy_rejected_logps,
+                ref_chosen_logps,    ref_rejected_logps,
+                beta=args.beta, weight=weight,
+            )
+            (loss / args.grad_accum).backward()
+            accum_loss += loss.item()
+
+            # Optimizer step every grad_accum examples
+            if (local_step + 1) % args.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+                accum_loss /= args.grad_accum
+
+                print(f"  step {global_step}/{max_steps}  loss={accum_loss:.4f}  "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}")
+
+                if not args.no_wandb:
+                    import wandb
+                    wandb.log({"train_loss": accum_loss, "lr": scheduler.get_last_lr()[0]}, step=global_step)
+
+                loss_log.add(global_step, train_loss=accum_loss)
+                accum_loss = 0.0
+
+                # Eval every 100 steps
+                if global_step % 100 == 0 or global_step == max_steps:
+                    model.eval()
+                    eval_loss = 0.0
+                    eval_steps = min(50, len(val_ds))
+                    for val_record in list(val_loader)[:eval_steps]:
+                        vpath = str(Path(args.video_dir) / f"{val_record['video_id']}.mp4")
+                        vmsg  = inject_video(val_record["messages"], vpath)
+                        try:
+                            cb = process_example(processor, vmsg, val_record["chosen"],   device)
+                            rb = process_example(processor, vmsg, val_record["rejected"], device)
+                            with torch.no_grad():
+                                with model.disable_adapter():
+                                    rc = get_logps_nograd(model, cb)
+                                    rr = get_logps_nograd(model, rb)
+                                pc = get_logps_nograd(model, cb)
+                                pr = get_logps_nograd(model, rb)
+                            eval_loss += dpo_loss(pc, pr, rc, rr, beta=args.beta).item()
+                        except Exception:
+                            pass
+                    eval_loss /= max(eval_steps, 1)
+                    print(f"  [eval]  loss={eval_loss:.4f}")
+                    loss_log.add(global_step, eval_loss=eval_loss)
+                    if not args.no_wandb:
+                        import wandb
+                        wandb.log({"eval_loss": eval_loss}, step=global_step)
+                    model.train()
+
+                # Checkpoint
+                if not args.debug and global_step % 200 == 0:
+                    ckpt = out_dir / f"checkpoint-{global_step}"
+                    model.save_pretrained(str(ckpt))
+                    print(f"  Saved checkpoint to {ckpt}")
+
+        if global_step >= max_steps:
+            break
+
+    # ── final save ───────────────────────────────────────────────────────
+    loss_log.close()
+    if not args.debug:
+        final = out_dir / "final"
+        model.save_pretrained(str(final))
+        processor.save_pretrained(str(final))
+        print(f"\nSaved to {final}")
+
+    print(f"Loss log: {out_dir}/loss_log.json")
     if not args.no_wandb:
         import wandb
-        print(f"W&B:       {wandb.run.url}")
+        print(f"W&B: {wandb.run.url}")
         wandb.finish()
 
 
