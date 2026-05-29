@@ -138,13 +138,14 @@ def encode_prompt_embeds(model, processor, messages_with_video: list[dict], devi
     input_ids = prompt_enc["input_ids"].to(device)
 
     with torch.no_grad():
-        embeds = base.model.embed_tokens(input_ids)  # (1, prompt_len, D)
+        embeds = base.get_input_embeddings()(input_ids)  # (1, prompt_len, D)
 
         if "pixel_values_videos" in prompt_enc:
             pv   = prompt_enc["pixel_values_videos"].to(device)
             grid = prompt_enc["video_grid_thw"].to(device)
             # Run visual encoder exactly once — this is the expensive step
-            video_embeds = base.model.visual(pv, grid_thw=grid)
+            visual_enc = base.model.visual if hasattr(base.model, "visual") else base.visual
+            video_embeds = visual_enc(pv, grid_thw=grid)
             video_mask = (
                 (input_ids == base.config.video_token_id)
                 .unsqueeze(-1)
@@ -180,7 +181,7 @@ def build_batch(
 
     base = _base_model(model)
     with torch.no_grad():
-        resp_embeds = base.model.embed_tokens(resp_ids.to(device))  # (1, resp_len, D)
+        resp_embeds = base.get_input_embeddings()(resp_ids.to(device))  # (1, resp_len, D)
 
     full_embeds = torch.cat([prompt_embeds, resp_embeds.detach()], dim=1)
 
