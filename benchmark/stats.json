@@ -1,0 +1,42 @@
+{
+  "total": 228,
+  "by_category": {
+    "resistance": 57,
+    "counterfactual_premise": 57,
+    "valid_correction": 57,
+    "true_claim_confirmation": 57
+  },
+  "by_visual": {
+    "A1": 124,
+    "A2": 104
+  },
+  "by_temporal": {
+    "B2": 116,
+    "B4": 112
+  },
+  "by_dataset": {
+    "charades": 228
+  },
+  "cell_coverage": {
+    "A1\u00d7B1": 0,
+    "A1\u00d7B2": 15,
+    "A1\u00d7B3": 0,
+    "A1\u00d7B4": 16,
+    "A2\u00d7B1": 0,
+    "A2\u00d7B2": 14,
+    "A2\u00d7B3": 0,
+    "A2\u00d7B4": 12,
+    "A3\u00d7B1": 0,
+    "A3\u00d7B2": 0,
+    "A3\u00d7B3": 0,
+    "A3\u00d7B4": 0,
+    "A4\u00d7B1": 0,
+    "A4\u00d7B2": 0,
+    "A4\u00d7B3": 0,
+    "A4\u00d7B4": 0,
+    "A5\u00d7B1": 0,
+    "A5\u00d7B2": 0,
+    "A5\u00d7B3": 0,
+    "A5\u00d7B4": 0
+  }
+}

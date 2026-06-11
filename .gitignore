@@ -1,8 +1,13 @@
-# raw annotation data (4.6 GB)
+# raw annotation data and large video files
 data/
 
-# generated checkpoint (redundant with train/val splits)
+# generated checkpoints (internal builder state, not needed for eval)
 output/checkpoint.jsonl
+benchmark/checkpoint.jsonl
+
+# logs and intermediate caches
+*.log
+data/candidates_cache.json
 
 # python
 __pycache__/

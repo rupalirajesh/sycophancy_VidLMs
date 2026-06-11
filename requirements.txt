@@ -11,5 +11,10 @@ openai>=1.30.0
 huggingface_hub>=0.24.0
 tqdm>=4.66.0
 
+# ── benchmark generation (build_sycobench.py) ───────────────────────────────────
+# google-generativeai is only needed for Tier 2 VLM oracle (Gemini watching videos).
+# Phase 2 text generation uses the OpenAI-compatible endpoint — no extra install needed.
+google-generativeai>=0.8.0
+
 # ── utilities ──────────────────────────────────────────────────────────────────
 matplotlib>=3.7.0
