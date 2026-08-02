@@ -1,0 +1,11 @@
+transformers>=4.57
+qwen-vl-utils
+decord
+accelerate
+torch
+numpy
+pandas
+tqdm
+pillow
+gdown
+statsmodels

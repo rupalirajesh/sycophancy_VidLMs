@@ -25,3 +25,14 @@ checkpoints/
 
 # jupyter checkpoints
 .ipynb_checkpoints/
+
+# handoff_v5 pipeline: downloaded raw video/annotation data (large, regenerates via
+# datasets/download_*.py -- never commit). This deliberately does NOT match the
+# pipeline's own output (results_*.jsonl, *.npz, run_*.txt) or the small bundled
+# datasets/nextqa_annotations/ files, which DO get committed/pushed back after a run.
+handoff_v5/**/videos/
+handoff_v5/**/perception_test/
+handoff_v5/**/nextqa_videos/
+handoff_v5/**/*.mp4
+handoff_v5/**/*.zip
+handoff_v5/**/*.zip.part
