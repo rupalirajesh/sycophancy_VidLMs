@@ -144,16 +144,33 @@ def main():
         run_probe(engine, "grounding_check", "main", it, visual, {"n_frames": BASE_FRAMES})
     log("Behavioral pass done.")
 
+    # Free the first model's GPU memory explicitly before loading the second copy --
+    # reassigning `model` alone doesn't guarantee CUDA memory is released before the
+    # new from_pretrained() call tries to allocate, which could OOM a second load that
+    # would otherwise fit (two sequential full-model loads, not overlapping in time).
+    del model, engine
+    torch.cuda.empty_cache()
     model, processor = common.load_model(common.MODEL_IDS[args.model], eager_attn=True)
     engine = Engine(model, processor)
     log("Model reloaded with eager attention for capture pass.")
 
     results = {(r["video_id"], r["qid"]): r for r in load_jsonl(output_file)
                if r["exp"] == "grounding_check"}
-    attn_out = {}
+    summary_path = out_dir / f"grounding_summary_{args.model}.jsonl"
+    already_captured = {(r["video_id"], r["qid"]) for r in load_jsonl(summary_path)}
+    if already_captured:
+        log(f"Resume: {len(already_captured)} items already captured in {summary_path.name}")
+
+    # Resuming a partial run: load whatever was already captured so the final save
+    # merges new captures in rather than overwriting prior ones (np.savez_compressed
+    # replaces the whole file, it doesn't append).
+    npz_path = out_dir / f"attn_grounding_{args.model}.npz"
+    attn_out = dict(np.load(npz_path)) if npz_path.exists() else {}
     n_ok, n_oom, n_skip = 0, 0, 0
     for it in tqdm(items, desc="attention capture"):
         key = (it["video_id"], it["qid"])
+        if key in already_captured:
+            continue
         r = results.get(key)
         if not r:
             n_skip += 1
@@ -206,7 +223,6 @@ def main():
             }) + "\n")
         n_ok += 1
 
-    npz_path = out_dir / f"attn_grounding_{args.model}.npz"
     np.savez_compressed(npz_path, **attn_out)
     log(f"Grounding-alignment capture: {n_ok} ok, {n_oom} OOM, {n_skip} skipped -> {npz_path}")
     log("Layer 2 grounding-check done.")

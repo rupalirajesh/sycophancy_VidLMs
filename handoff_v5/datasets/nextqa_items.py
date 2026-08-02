@@ -39,11 +39,37 @@ def load_grounding(annotations_dir, split):
     return json.load(open(path))
 
 
+_RECURSIVE_INDEX_CACHE = {}
+
+
+def _recursive_filename_index(video_dir):
+    """Lazily-built, cached map of {'<vid>.mp4' -> full path} across the whole
+    video_dir tree. Built once per video_dir, not per item. This exists
+    because the NExT-QA/GQA video archive is a single ~multi-GB Google Drive
+    zip whose internal folder layout was never actually verified in this
+    project (downloading it fully just to check was impractical) — rather
+    than assume one specific layout and silently resolve to nothing if that
+    guess is wrong, fall back to actually finding the file wherever it landed."""
+    video_dir = str(video_dir)
+    if video_dir not in _RECURSIVE_INDEX_CACHE:
+        index = {}
+        p = Path(video_dir)
+        if p.exists():
+            for f in p.rglob("*.mp4"):
+                index.setdefault(f.name, str(f))
+        _RECURSIVE_INDEX_CACHE[video_dir] = index
+    return _RECURSIVE_INDEX_CACHE[video_dir]
+
+
 def resolve_video_path(video_dir, vid, vidor_map):
-    """NExT-QA's extracted zip nests videos under a subfolder path from
-    map_vid_vidorID.json (e.g. video 2909445186 -> 0101/2909445186.mp4).
-    Falls back to a flat <video_dir>/<vid>.mp4 in case the archive was
-    re-flattened during download/extraction."""
+    """Tries, in order: (1) the subfolder path from map_vid_vidorID.json
+    (e.g. video 2909445186 -> 0101/2909445186.mp4 — this is the documented
+    layout, but unverified against the real archive at build time); (2) a
+    flat <video_dir>/<vid>.mp4; (3) a one-time-cached recursive scan of the
+    whole video_dir tree by filename, in case the real layout is neither of
+    the above. Only returns a path that was NOT found by any of these as a
+    last resort (the flat guess), so callers' Path(...).exists() checks
+    correctly filter it out rather than silently treating a guess as data."""
     video_dir = Path(video_dir)
     subpath = vidor_map.get(vid)
     if subpath:
@@ -51,7 +77,12 @@ def resolve_video_path(video_dir, vid, vidor_map):
         if candidate.exists():
             return str(candidate)
     flat = video_dir / f"{vid}.mp4"
-    return str(flat)
+    if flat.exists():
+        return str(flat)
+    indexed = _recursive_filename_index(video_dir).get(f"{vid}.mp4")
+    if indexed:
+        return indexed
+    return str(flat)   # doesn't exist; callers filter this out via .exists()
 
 
 def build_items(annotations_dir, video_dir, split="val"):

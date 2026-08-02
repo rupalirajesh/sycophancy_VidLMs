@@ -104,7 +104,40 @@ def main():
         print(f"ERROR: {zip_path} is corrupt — delete it and re-run this script.", file=sys.stderr)
         raise
     marker.touch()
+
+    _verify_resolution(video_dir)
     print(f"NEXTQA_READY: {video_dir}")
+
+
+def _verify_resolution(video_dir):
+    """This archive's internal folder layout was never verified against the
+    real multi-GB file in development (impractical to download here) — check
+    it NOW, once, cheaply, rather than let a wrong guess surface silently as
+    zero NExT-QA items deep into a GPU run. Not a bug if this prints a low
+    number; it means resolve_video_path's guesses didn't match and its
+    recursive-scan fallback (see nextqa_items.py) is doing the real work —
+    still fine, just slower to build the index on first use."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import nextqa_items
+    ann_dir = Path(__file__).parent / "nextqa_annotations"
+    vidor_map = nextqa_items.load_map_vid_vidorid(ann_dir)
+    sample_ids = list(vidor_map.keys())[:200]
+    found = sum(1 for vid in sample_ids
+                if Path(nextqa_items.resolve_video_path(video_dir, vid, vidor_map)).exists())
+    pct = 100 * found / len(sample_ids) if sample_ids else 0
+    print(f"\nVideo-path resolution check: {found}/{len(sample_ids)} sampled video IDs "
+          f"({pct:.0f}%) resolved to an actual file under {video_dir}.")
+    if found == 0:
+        print("WARNING: 0% resolved. Either the zip's internal layout doesn't match any of "
+              "resolve_video_path's strategies (check what's actually under "
+              f"{video_dir} by hand — `find {video_dir} -name '*.mp4' | head`), or the "
+              "download/extraction didn't actually produce video files. Report this rather "
+              "than proceeding — the pipeline will silently show 0 NExT-QA items otherwise, "
+              "not a clear error.", file=sys.stderr)
+    elif pct < 50:
+        print(f"NOTE: resolution is partial ({pct:.0f}%) — some videos may be missing from "
+              "the archive itself (this happens; not every dataset paper's release is 100% "
+              "complete), not necessarily a path-resolution bug.")
 
 
 if __name__ == "__main__":
