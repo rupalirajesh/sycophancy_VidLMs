@@ -139,15 +139,33 @@ printed.
   that condition/sample size (itself a real finding, report it) or increase
   `--n-items` on the upstream stage first.
 
-## Step 5 — Package results for handback
+## Step 5 — Push results back to the repo
+
+This repo is `sycophancy_VidLMs` (github.com/rupalirajesh/sycophancy_VidLMs).
+You're running on a clone of it. Once the pipeline finishes (or after any
+stage you want to checkpoint), **push the results to a dedicated branch** —
+not directly to `main`, so the owner can review/merge rather than an
+unattended push landing on the branch they're actively working on:
 
 ```bash
 for f in ./out/results_*.jsonl ./out/grounding_summary_*.jsonl ./out/knockout_*.jsonl ./out/patching_*.jsonl; do
   [ -f "$f" ] && echo "$f: $(wc -l < "$f") records"
 done
-python3 analyze.py --out-dir ./out --model qwen3   # should run with no exceptions
+python3 analyze.py --out-dir ./out --model qwen3   # should run with no exceptions first
+
+git checkout -b results/v5-run-$(date +%Y%m%d)
+git add out/*.jsonl out/*.txt out/*.npz out/analysis_summary_*.txt 2>/dev/null
+git status   # SANITY CHECK before committing: this must show only small
+             # result files (JSONL/txt/npz), never *.mp4/*.zip or a
+             # perception_test/nextqa_videos directory -- if you see those,
+             # STOP, do not commit, the .gitignore should already exclude
+             # them (handoff_v5/**/videos/, *.mp4, *.zip) but verify rather
+             # than assume
+git commit -m "V5 pipeline results: <model>, <split>, <n items> -- <one-line summary of what analyze.py showed>"
+git push -u origin results/v5-run-$(date +%Y%m%d)
 ```
-Send back the whole `./out` directory's JSONL/txt/npz files (not the
-downloaded video/annotation data itself — that regenerates from the download
-scripts). Report the final record counts per stage and the full analysis
-output — that's the deliverable, not just "it finished."
+Report the branch name and the full `analyze.py` output back — that's the
+deliverable, not just "it finished." Do this even if only some stages
+completed (e.g. Perception Test finished but NExT-QA/GQA video download
+never did) — partial real results checkpointed and pushed are worth more
+than nothing landing anywhere.
